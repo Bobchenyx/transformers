@@ -100,49 +100,132 @@ class DeepseekV3MLP(nn.Module):
 
 
 class DeepseekV3TopkRouter(nn.Module):
+    """
+    Top-K Router with group-based expert selection for DeepSeek V3.
+    
+    This router implements a two-stage selection process:
+    1. Group Selection: First select top groups of experts (coarse-grained)
+    2. Expert Selection: Then select top-k experts from the selected groups (fine-grained)
+    
+    Example with 256 experts, 8 groups, topk_group=4, top_k=8:
+    - Stage 1: Divide 256 experts into 8 groups (32 experts each)
+    - Stage 2: Select 4 best groups (128 experts remain as candidates)
+    - Stage 3: Select final 8 experts from these 128 candidates
+    
+    This hierarchical approach reduces computation and improves load balancing.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.top_k = config.num_experts_per_tok
-        self.n_routed_experts = config.n_routed_experts
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.n_group = config.n_group
-        self.topk_group = config.topk_group
-        self.norm_topk_prob = config.norm_topk_prob
+        self.top_k = config.num_experts_per_tok  # Number of experts activated per token, default 8
+        self.n_routed_experts = config.n_routed_experts  # Total number of routable experts, default 256
+        self.routed_scaling_factor = config.routed_scaling_factor  # Scaling factor for routing weights, default 2.5
+        self.n_group = config.n_group  # Number of expert groups, default 8
+        self.topk_group = config.topk_group  # Number of groups to select, default 4
+        self.norm_topk_prob = config.norm_topk_prob  # Whether to normalize weights, default True
 
+        # Router weight matrix: one weight vector per expert for computing token-expert affinity
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)))
+        # Expert load balancing bias term to correct expert selection bias
         self.register_buffer("e_score_correction_bias", torch.zeros(self.n_routed_experts))
 
     @torch.no_grad()
     def get_topk_indices(self, scores):
+        """
+        Two-stage expert selection with group-based routing.
+        
+        Args:
+            scores: Expert affinity scores, shape [num_tokens, n_routed_experts]
+        
+        Returns:
+            topk_indices: Selected expert indices, shape [num_tokens, top_k]
+        
+        Process:
+            1. Apply load balancing bias correction
+            2. Group-level selection: Choose topk_group best groups
+            3. Expert-level selection: Choose top_k experts from selected groups
+        """
+        # Step 1: Apply load balancing bias correction
+        # Add bias to encourage using less-loaded experts, shape: [num_tokens, n_routed_experts]
         scores_for_choice = scores.view(-1, self.n_routed_experts) + self.e_score_correction_bias.unsqueeze(0)
+
+        # Step 2: Compute group scores
+        # Divide experts into n_group groups, each containing n_routed_experts // n_group experts
+        # Example: 256 experts -> 8 groups, 32 experts per group
+        # Shape transformation: [num_tokens, 256] -> [num_tokens, 8, 32]
         group_scores = (
             scores_for_choice.view(-1, self.n_group, self.n_routed_experts // self.n_group)
-            .topk(2, dim=-1)[0]
-            .sum(dim=-1)
+            .topk(2, dim=-1)[0]  # Select scores of top-2 experts within each group
+            .sum(dim=-1)  # Sum top-2 scores as the representative score for the group, shape: [num_tokens, n_group]
         )
+
+        # Step 3: Select topk_group best groups
+        # Example: Select 4 best groups from 8 groups
         group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+
+        # Step 4: Create group mask to mark selected groups
+        # Shape: [num_tokens, n_group]
         group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1)
+        group_mask.scatter_(1, group_idx, 1)  # Set selected group positions to 1
+
+        # Step 5: Expand group mask to expert level
+        # Shape transformation: [num_tokens, 8] -> [num_tokens, 8, 32] -> [num_tokens, 256]
+        # Only experts within selected groups have True values
         score_mask = (
             group_mask.unsqueeze(-1)
             .expand(-1, self.n_group, self.n_routed_experts // self.n_group)
             .reshape(-1, self.n_routed_experts)
         )
+
+        # Step 6: Mask out experts from unselected groups (set their scores to 0)
+        # Example: If only 4 groups are selected, the other 4 groups' experts (128 experts) get score 0
         scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+
+        # Step 7: Select top_k experts from remaining candidates
+        # Example: Select final 8 experts from 128 candidate experts
         topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
         return topk_indices
 
     def forward(self, hidden_states):
+        """
+        Compute expert routing: determine which experts to activate and their weights.
+        
+        Args:
+            hidden_states: Input token representations, shape [batch_size, seq_len, hidden_size]
+        
+        Returns:
+            topk_indices: Selected expert indices for each token, shape [num_tokens, top_k]
+            topk_weights: Normalized weights for selected experts, shape [num_tokens, top_k]
+                         Sum of weights per token = routed_scaling_factor (e.g., 2.5)
+        """
+        # Step 1: Flatten batch and sequence dimensions
+        # Shape: [batch_size, seq_len, hidden_size] -> [num_tokens, hidden_size]
         hidden_states = hidden_states.view(-1, self.config.hidden_size)
+
+        # Step 2: Compute routing logits (token-expert affinity scores)
+        # Shape: [num_tokens, n_routed_experts], e.g., [num_tokens, 256]
         router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+
+        # Step 3: Apply sigmoid activation to convert logits to scores in [0, 1]
         scores = router_logits.sigmoid()
+
+        # Step 4: Perform two-stage expert selection (group selection + expert selection)
         topk_indices = self.get_topk_indices(scores)
+
+        # Step 5: Gather weights corresponding to selected experts
+        # Shape: [num_tokens, top_k]
         topk_weights = scores.gather(1, topk_indices)
+
+        # Step 6: Normalize weights so that each token's weights sum to 1
         if self.norm_topk_prob:
-            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
-            topk_weights /= denominator
+            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20  # Avoid division by zero
+            topk_weights /= denominator  # Normalize: sum(weights) = 1
+
+        # Step 7: Apply scaling factor, final weight sum = routed_scaling_factor (default 2.5)
+        # This scaling balances the contribution of routed experts vs shared experts
         topk_weights = topk_weights * self.routed_scaling_factor
+
         return topk_indices, topk_weights
 
 
@@ -166,38 +249,93 @@ class DeepseekV3MoE(nn.Module):
         )
 
     def moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor):
-        r"""
-        CALL FOR CONTRIBUTION! I don't have time to optimise this right now, but expert weights need to be fused
-        to not have to do a loop here (deepseek has 256 experts soooo yeah).
         """
+        Route tokens to selected experts and aggregate their weighted outputs.
+        
+        Args:
+            hidden_states: Input tokens, shape [num_tokens, hidden_size]
+            topk_indices: Selected expert indices per token, shape [num_tokens, top_k]
+            topk_weights: Weights for selected experts, shape [num_tokens, top_k]
+        
+        Returns:
+            Aggregated expert outputs, shape [num_tokens, hidden_size]
+            Each token's output = sum(weight_i * expert_i(token)) for selected experts
+        
+        Note:
+            CALL FOR CONTRIBUTION! This implementation can be optimized by fusing expert weights
+            to avoid the loop over 256 experts. Current implementation is not optimized for speed.
+        """
+        # Step 1: Initialize output accumulator with zeros
         final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
+        
+        # Step 2: Create expert assignment mask
+        # Convert expert indices to one-hot encoding: [num_tokens, top_k] -> [num_tokens, top_k, n_experts]
         expert_mask = torch.nn.functional.one_hot(topk_indices, num_classes=len(self.experts))
+        # Permute to [n_experts, num_tokens, top_k] for easier expert-wise iteration
         expert_mask = expert_mask.permute(2, 0, 1)
 
+        # Step 3: Process each expert (loop over 256 experts)
         for expert_idx in range(len(self.experts)):
             expert = self.experts[expert_idx]
-            mask = expert_mask[expert_idx]
+            # Get mask for current expert: which tokens are assigned to this expert
+            mask = expert_mask[expert_idx]  # [num_tokens, top_k]
+            # Find token positions that selected this expert
             token_indices, weight_indices = torch.where(mask)
 
+            # Step 4: Process tokens assigned to this expert (if any)
             if token_indices.numel() > 0:
-                expert_weights = topk_weights[token_indices, weight_indices]
-                expert_input = hidden_states[token_indices]
-                expert_output = expert(expert_input)
-                weighted_output = expert_output * expert_weights.unsqueeze(-1)
+                # Gather weights for this expert from the routing weights
+                expert_weights = topk_weights[token_indices, weight_indices]  # [num_assigned_tokens]
+                # Gather input tokens assigned to this expert
+                expert_input = hidden_states[token_indices]  # [num_assigned_tokens, hidden_size]
+                # Process through the expert MLP
+                expert_output = expert(expert_input)  # [num_assigned_tokens, hidden_size]
+                # Apply routing weights (element-wise multiplication)
+                weighted_output = expert_output * expert_weights.unsqueeze(-1)  # [num_assigned_tokens, hidden_size]
+                # Accumulate weighted outputs back to their original token positions
+                # This performs: final_hidden_states[token_indices] += weighted_output
                 final_hidden_states.index_add_(0, token_indices, weighted_output)
 
-        # in original deepseek, the output of the experts are gathered once we leave this module
-        # thus the moe module is itelsf an IsolatedParallel module
-        # and all expert are "local" meaning we shard but we don't gather
+        # Note: In original DeepSeek implementation with tensor parallelism:
+        # - The MoE module is an IsolatedParallel module
+        # - Experts are "local" (sharded across devices but not gathered here)
+        # - Gathering happens outside this module
         return final_hidden_states.type(hidden_states.dtype)
 
     def forward(self, hidden_states):
+        """
+        Forward pass combining routed experts and shared experts.
+        
+        Args:
+            hidden_states: Input tensor, shape [batch_size, seq_len, hidden_size]
+        
+        Returns:
+            Output tensor with same shape as input: [batch_size, seq_len, hidden_size]
+            Final output = weighted_routed_experts_output + shared_experts_output
+        """
+        # Step 1: Save residual for shared experts (they process the original input)
         residuals = hidden_states
-        orig_shape = hidden_states.shape
+        
+        # Step 2: Save original shape to restore after processing
+        orig_shape = hidden_states.shape  # [batch_size, seq_len, hidden_size]
+        
+        # Step 3: Route tokens to experts - get which experts to use and their weights
+        # topk_indices: [num_tokens, top_k=8] - expert indices for each token
+        # topk_weights: [num_tokens, top_k=8] - weights summing to routed_scaling_factor (2.5)
         topk_indices, topk_weights = self.gate(hidden_states)
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        
+        # Step 4: Flatten batch and sequence dimensions for expert processing
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])  # [num_tokens, hidden_size]
+        
+        # Step 5: Process through routed experts with weighted aggregation, then restore shape
+        # Each token is processed by its top-k selected experts, outputs are weighted and summed
         hidden_states = self.moe(hidden_states, topk_indices, topk_weights).view(*orig_shape)
+        
+        # Step 6: Add shared experts output (processed from original residuals)
+        # Shared experts are always active for all tokens (no routing)
+        # Final output = routed_experts (weight_sum=2.5) + shared_experts (weight=1.0)
         hidden_states = hidden_states + self.shared_experts(residuals)
+        
         return hidden_states
 
 
